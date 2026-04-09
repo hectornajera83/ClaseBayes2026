@@ -1,0 +1,240 @@
+---
+title: "Flexibilidad del Modelado Bayesiano con Stan: Heterocedasticidad"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(tidyverse)
+options(mc.cores = parallel::detectCores())
+color_scheme_set("blue")
+```
+
+## Introducción
+
+Este ejemplo muestra cómo el enfoque bayesiano con Stan permite ajustar modelos flexibles que serían difíciles o imposibles de estimar con métodos clásicos. En particular, consideramos un modelo en el que tanto la **media como la varianza** del salario dependen del nivel educativo.
+
+## Simulación de Datos con Heterocedasticidad
+
+```{r simulate-data, include=FALSE}
+set.seed(123)
+N <- 100
+educ <- runif(N, 8, 16)  # años de educación
+
+alpha <- log(1000)
+beta <- log(1.08)  # efecto medio de la educación
+
+gamma_0 <- -1  # log(sigma) base
+gamma_1 <- -0.35  # mayor educación → menor varianza
+
+mu <- alpha + beta * educ
+sigma <- exp(gamma_0 + gamma_1 * educ)
+
+log_wage <- rnorm(N, mean = mu, sd = sigma)
+wage <- exp(log_wage)
+
+data <- tibble(wage, log_wage, educ, sigma)
+```
+
+```{r}
+ggplot(data, aes(x = educ, y = wage)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm") +
+  labs(x = "Años de educación", y = "Salario")
+```
+
+## Modelo Bayesiano: Media y Varianza Dependientes de Educación
+
+Modelo completo:
+
+\[
+\begin{aligned}
+\log(wage_i) &\sim \mathcal{N}(\mu_i, \sigma_i^2) \\
+\mu_i &= \alpha + \beta \cdot educ_i \\
+\log(\sigma_i) &= \gamma_0 + \gamma_1 \cdot educ_i
+\end{aligned}
+\]
+
+- El coeficiente `\( \gamma_1 \)` indica cómo cambia la **desviación estándar** del log-salario con la educación. Un valor negativo implica que **a mayor educación, menor incertidumbre salarial**.
+
+Distribuciones a priori e interpretación
+
+- **\(\alpha \sim \mathcal{N}(7,\ 2^2)\)**  
+  Representa el log-salario esperado para una persona con **cero años de educación**.  
+  Esta prior es *débilmente informativa*, con alta incertidumbre.  
+  \(\exp(7) \approx 1096\), por lo que se espera que el salario base esté alrededor de \$1000, pero puede variar ampliamente.
+
+- **\(\beta \sim \mathcal{N}(0.08,\ 0.05^2)\)**  
+  Representa el **retorno salarial por cada año adicional de educación** (en escala log).  
+  En términos salariales, esto implica:  
+  \[
+  \exp(0.08) \approx 1.083
+  \]  
+  Es decir, se espera un incremento promedio de aproximadamente **8.3% por año adicional de educación**, coherente con estimaciones empíricas en la literatura económica.
+
+- **\(\gamma_0 \sim \mathcal{N}(-1,\ 1^2)\)**  
+  Controla el nivel base de la **desviación estándar** del log-salario.  
+  \[
+  \exp(-1) \approx 0.37
+  \]  
+  Es decir, se espera que la dispersión salarial base sea moderada, pero se permite cierta flexibilidad.
+
+- **\(\gamma_1 \sim \mathcal{N}(0,\ 0.2^2)\)**  
+  Captura cómo cambia la **desviación estándar** del log-salario con la educación.  
+  Un valor **negativo** implica que, a mayor educación, hay **menor incertidumbre salarial** (más estabilidad).  
+  Un valor **positivo** indica lo contrario: mayor educación → más dispersión.
+
+Estas priors combinan conocimiento empírico con flexibilidad, permitiendo un modelo robusto y realista, especialmente útil cuando el tamaño muestral es reducido o hay colinealidad en los datos.
+
+## Código del Modelo en Stan
+
+```{r stan-code}
+stan_code <- "
+data {
+  int<lower=0> N;
+  vector[N] log_wage;
+  vector[N] educ;
+}
+parameters {
+  real alpha;
+  real beta;
+  real gamma_0;
+  real gamma_1;
+}
+model {
+  alpha ~ normal(7, 2);
+  beta ~ normal(0.08, 0.05);
+  gamma_0 ~ normal(-1, 1);
+  gamma_1 ~ normal(0, 0.2);
+
+  for (i in 1:N) {
+    log_wage[i] ~ normal(alpha + beta * educ[i], exp(gamma_0 + gamma_1 * educ[i]));
+  }
+}
+generated quantities {
+  vector[N] sigma;
+  for (i in 1:N) {
+    sigma[i] = exp(gamma_0 + gamma_1 * educ[i]);
+  }
+}
+"
+```
+
+## Ajuste del Modelo
+
+```{r fit-model}
+stan_data <- list(N = N, log_wage = data$log_wage, educ = data$educ)
+model <- cmdstan_model(write_stan_file(stan_code), cpp_options = list(stan_threads = TRUE))
+fit <- model$sample(
+  data = stan_data,
+  chains = 4,
+  parallel_chains = 4,
+  threads_per_chain = 2,
+  iter_sampling = 2000,
+  iter_warmup = 500,
+  seed = 123
+)
+fit$print(variables = c("alpha", "beta", "gamma_0", "gamma_1"))
+```
+
+## Visualización: Varianza Estimada vs. Real
+
+```{r sigma-comparison}
+sigma_draws <- fit$draws(variables = "sigma", format = "df")
+sigma_post_mean <- sigma_draws %>% select(starts_with("sigma")) %>% colMeans()
+
+data$sigma_post <- sigma_post_mean
+
+ggplot(data, aes(x = educ)) +
+  geom_line(aes(y = sigma), color = "blue", linetype = "dashed") +
+  geom_line(aes(y = sigma_post), color = "red") +
+  labs(y = "Desviación estándar del log-salario",
+       title = "Varianza real (azul) vs. estimada por el modelo (rojo)",
+       subtitle = "El modelo bayesiano recupera bien la heterocedasticidad simulada")
+```
+
+**Interpretación:** El gráfico muestra cómo el modelo bayesiano logra estimar correctamente que la varianza del salario disminuye con la educación, acercándose mucho a los valores simulados (línea azul). La línea roja representa el valor posterior medio estimado.
+
+## Comparación con Modelo Clásico
+
+```{r classic-fit}
+lm_fit <- lm(log(wage) ~ educ, data = data)
+summary(lm_fit)
+
+plot(lm_fit$fitted.values, resid(lm_fit),
+     xlab = "Valores ajustados", ylab = "Residuos",
+     main = "Residuos del modelo clásico")
+abline(h = 0, lty = 2)
+```
+
+**Interpretación:** El modelo clásico `lm()` asume varianza constante. En el gráfico de residuos se puede observar que, para niveles bajos de educación, los residuos tienden a ser más dispersos, lo que indica **heterocedasticidad no capturada** por el modelo clásico. Esto muestra una limitación importante frente a la flexibilidad del enfoque bayesiano.
+
+```{r}
+# Valores secuenciales de educación para predecir
+educ_grid <- tibble(educ = seq(8, 16, length.out = 100))
+
+### Modelo clásico: predicción + intervalo de predicción
+pred_lm <- predict(lm_fit, newdata = educ_grid, interval = "prediction", level = 0.95)
+educ_grid <- educ_grid %>%
+  mutate(
+    fit_lm = pred_lm[, "fit"],
+    lwr_lm = pred_lm[, "lwr"],
+    upr_lm = pred_lm[, "upr"]
+  )
+
+### Modelo bayesiano: usamos draws para generar predicciones posteriores
+draws <- fit$draws(format = "df")
+alpha_draws <- draws$alpha
+beta_draws <- draws$beta
+gamma_0_draws <- draws$gamma_0
+gamma_1_draws <- draws$gamma_1
+
+# Creamos una matriz de predicciones para cada punto de la grilla
+set.seed(123)
+n_draws <- 500  # cantidad de muestras a usar para predicción
+pred_matrix <- sapply(educ_grid$educ, function(e) {
+  mu <- alpha_draws[1:n_draws] + beta_draws[1:n_draws] * e
+  sigma <- exp(gamma_0_draws[1:n_draws] + gamma_1_draws[1:n_draws] * e)
+  rnorm(n_draws, mu, sigma)
+})
+
+# Extraemos percentiles para construir el intervalo de predicción
+pred_quantiles <- apply(pred_matrix, 2, quantile, probs = c(0.025, 0.5, 0.975))
+
+educ_grid <- educ_grid %>%
+  mutate(
+    lwr_bayes = pred_quantiles[1, ],
+    fit_bayes = pred_quantiles[2, ],
+    upr_bayes = pred_quantiles[3, ]
+  )
+
+
+ggplot(data, aes(x = educ, y = log_wage)) +
+  geom_point(alpha = 0.4) +
+  geom_ribbon(data = educ_grid, aes(x = educ, ymin = lwr_lm, ymax = upr_lm), 
+              fill = "red", alpha = 0.2, inherit.aes = FALSE) +
+  geom_line(data = educ_grid, aes(x = educ, y = fit_lm), 
+            color = "red", linetype = "dashed", inherit.aes = FALSE) +
+  geom_ribbon(data = educ_grid, aes(x = educ, ymin = lwr_bayes, ymax = upr_bayes), 
+              fill = "blue", alpha = 0.2, inherit.aes = FALSE) +
+  geom_line(data = educ_grid, aes(x = educ, y = fit_bayes), 
+            color = "blue", inherit.aes = FALSE) +
+  labs(
+    title = "Comparación de Intervalos de Predicción",
+    subtitle = "Rojo: modelo clásico (varianza constante); Azul: modelo bayesiano (varianza flexible)",
+    y = "log(Salario)", x = "Años de educación"
+  )
+```
+
+
+## Discusión
+
+- El modelo clásico asume varianza constante y no puede capturar la heterocedasticidad.
+- El modelo bayesiano con Stan permite modelar la varianza como función de la educación.
+- ¿Qué otros contextos económicos podrían beneficiarse de esta flexibilidad?

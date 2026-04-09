@@ -1,0 +1,385 @@
+---
+title: "Estimación Bayesiana de la Brecha Salarial de Género (Modelo Log-normal)"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+options(mc.cores = parallel::detectCores())
+color_scheme_set("blue")
+```
+
+## 1. Flujo de Trabajo en Modelado Bayesiano con Stan y R
+
+El proceso de modelación bayesiana en Stan y R sigue una serie de pasos que ayudan a organizar el razonamiento estadístico y la implementación computacional. Aquí describimos el flujo general de trabajo:
+
+### Identificación de las hipótesis y el modelo generativo
+
+- Variable de interés: salario de individuos en una empresa progresiva de tamaño mediano.
+- Queremos estimar las diferencias entre hombres y mujeres en salarios.
+- Sabemos que los salarios no siguen una distribución normal simétrica, sino que están sesgados a la derecha.
+
+### Especificación del Modelo Generativo
+
+- ¿Qué sabemos sobre la distribución estadística de los salarios?
+- En lugar de modelar directamente el salario, modelamos el **logaritmo del salario**, que suele estar más cerca de una distribución normal.
+- Esto implica asumir que `log(salario)` sigue una distribución normal, lo que equivale a suponer que el salario tiene una distribución log-normal.
+
+Suponemos que los datos observados siguen una distribución log-normal, es decir, modelamos el logaritmo del salario:
+
+\[
+\log(\text{wage}_i) \sim \mathcal{N}(\alpha + \beta \cdot \text{female}_i,\ \sigma^2)
+\]
+
+donde:
+- \(\alpha\) es el log-salario promedio para los hombres (\(\text{female}_i = 0\)),
+- \(\beta\) representa la diferencia entre hombres y mujeres en el logaritmo del salario,
+- \(\sigma\) es la desviación estándar del log-salario.
+
+### Asignamos las siguientes distribuciones a priori a los parámetros:
+
+\[
+\begin{aligned}
+\alpha &\sim \mathcal{N}(7,\ 2^2) \\
+\beta &\sim \mathcal{N}(0,\ 0.1^2) \\
+\sigma &\sim \text{Cauchy}^{+}(0,\ .5)
+\end{aligned}
+\]
+
+donde \(\text{Cauchy}^{+}\) indica que la distribución Cauchy está truncada en \(\sigma > 0\).
+
+### Justificación de las Distribuciones A Priori
+
+Las distribuciones a priori fueron elegidas para reflejar conocimiento moderado e incorporar información contextual razonable sin ser excesivamente restrictivas.
+
+- **Prior para $\alpha$ (nivel base del log-salario):**
+
+  \[
+  \alpha \sim \mathcal{N}(7,\ 2^2)
+  \]
+
+  Esta prior refleja que el salario promedio para hombres (grupo base) se espera que esté alrededor de \( \exp(7) \approx 1096 \), pero con mucha incertidumbre (el intervalo de ±2 desviaciones estándar incluye salarios desde alrededor de 200 hasta más de 6000). Este prior es *débilmente informativo*.
+
+- **Prior para $\beta$ (efecto de sexo):**
+
+  \[
+  \beta \sim \mathcal{N}(0,\ 0.1^2)
+  \]
+
+  Este prior es **informativo** y expresa la creencia de que, *a priori*, es poco probable que el efecto de género sea muy grande. En términos de salario relativo:
+
+  \[
+  \exp(0.1) \approx 1.105, \quad \exp(-0.1) \approx 0.905
+  \]
+
+  Es decir, se espera que la diferencia de hombres y mujeres de salario entre -10% y +10% aproximadamente, antes de ver los datos. Esta prior representa escepticismo hacia efectos grandes, lo cual es útil en contextos con muestras pequeñas, ya que reduce la probabilidad de falsos positivos.
+
+- **Prior para $\sigma$ (desviación estándar del log-salario):**
+
+  \[
+  \sigma \sim \text{Cauchy}^+(0,\ .5)
+  \]
+
+  El prior Cauchy positivo es una elección común para parámetros de escala porque permite valores pequeños, pero también deja abierta la posibilidad de valores grandes (colas pesadas). Es un prior *débilmente informativo* que evita restricciones artificiales sobre la dispersión de los salarios.
+
+### Escritura del Modelo en Stan
+
+- Definimos el modelo en términos de `log(wage)`.
+- Especificamos priors para los parámetros y el modelo de verosimilitud.
+
+### Llamada desde R
+
+- Transformamos los datos (`log(wage)`), creamos la lista para Stan.
+- Ajustamos el modelo y analizamos los resultados.
+
+### Chequeos predictivos posteriores
+
+- Convergencia
+- Capacidad predictiva del modelo
+
+### Inferencia sobre la posterior
+
+## Datos 
+
+Simulamos un conjunto de datos en el que la brecha salarial observada parece estadísticamente significativa bajo un enfoque clásico/frecuentista, pero desaparece cuando usamos una prior informativa moderada en el enfoque bayesiano.
+
+```{r simulate-data, include=FALSE}
+set.seed(321)
+N <- 30
+female <- rbinom(N, 1, 0.5)  # 0 = hombre, 1 = mujer
+alpha <- log(2000)
+beta <- 0  # En realidad no hay efecto de género
+sigma <- 0.2
+log_wage <- rnorm(N, mean = alpha + beta * female, sd = sigma)
+# Introducimos algo de ruido artificial para que parezca significativo
+log_wage[female == 1] <- log_wage[female == 1] - 0.13
+wage <- exp(log_wage)
+
+data <- data.frame(wage, log_wage, female)
+ggplot(data, aes(x = as.factor(female), y = wage)) +
+  geom_boxplot() +
+  labs(x = "Mujer (1 = sí)", y = "Salario")
+```
+
+## Código del Modelo en Stan (Log-salario)
+
+En lugar de guardar el modelo en un archivo `.stan`, podemos escribirlo directamente dentro del código y compilarlo con `cmdstan_model(write_stan_file(...))`:
+
+El código de stan tiene **4** bloques y usa la lógica de escritura modular de C++:
+
+- Datos: Variables y características del modelo
+- Parámetros: Nombres de los parámetros
+- Modelo: Priors y verosimulitud
+- Cantidades generadas: Predicción bajo las posteriores
+
+```{r stan-code-inline}
+stan_code <- "
+data {
+  int<lower=0> N;   // tamaño de muestra
+  vector[N] log_wage; // variable dependiente
+  vector[N] female; // variable explicativa
+}
+parameters {
+  real alpha; // ordenada al origen
+  real beta; // parámetro de la diferencia hombres-mujeres
+  real<lower=0> sigma; // varianza
+}
+model {
+  alpha ~ normal(7, 2); // EN ESCALA DE logaritmo 
+  beta ~ normal(0, 0.1); // EN ESCALA DE logaritmo 
+  sigma ~ cauchy(0, .5); // EN ESCALA DE logaritmo: muy grande
+
+  log_wage ~ normal(alpha + beta .* female, sigma); // Modelo general explicativo 
+}
+generated quantities {
+  vector[N] log_wage_rep; // Posterior total del modelo estimado 
+  for (i in 1:N) {
+    log_wage_rep[i] = normal_rng(alpha + beta * female[i], sigma);
+  }
+}
+"
+```
+
+## 4. Prior predictive checks: 
+
+La simulación desde los priors con Stan es una forma de revisar si los *a prioris* del modelo generativo producen resultados razonables de la distribución observada. 
+
+```{r prior-predictive-stan}
+prior_stan_code <- "
+data {
+  int<lower=1> N;
+  vector[N] female;
+}
+generated quantities {
+  real alpha = normal_rng(7, 2);
+  real beta = normal_rng(0, 0.1);
+  real sigma = abs(cauchy_rng(0, .5));
+
+  vector[N] log_wage_sim;
+  for (i in 1:N) {
+    log_wage_sim[i] = normal_rng(alpha + beta * female[i], sigma);
+  }
+}
+"
+
+prior_model <- cmdstan_model(write_stan_file(prior_stan_code))
+
+female_sim <- rbinom(N, 1, 0.5)
+
+sim_prior <- prior_model$sample(
+  data = list(N = N, female = female_sim),
+  fixed_param = TRUE,
+  chains = 1,
+  iter_sampling = 1000,
+  seed = 123
+)
+
+log_wage_sim_draws <- sim_prior$draws("log_wage_sim", format = "matrix")
+
+y_fake <- as.numeric(log_wage_sim_draws[1, ])
+ppc_dens_overlay(y = y_fake, yrep = log_wage_sim_draws[1:50, ])
+```
+
+### Varianza más reducida:  *real sigma = abs(cauchy_rng(0, .1));*
+
+```{r prior-predictive-stan2}
+prior_stan_code <- "
+data {
+  int<lower=1> N;
+  vector[N] female;
+}
+generated quantities {
+  real alpha = normal_rng(7, 2);
+  real beta = normal_rng(0, 0.1);
+  real sigma = abs(cauchy_rng(0, .1));
+
+  vector[N] log_wage_sim;
+  for (i in 1:N) {
+    log_wage_sim[i] = normal_rng(alpha + beta * female[i], sigma);
+  }
+}
+"
+
+prior_model <- cmdstan_model(write_stan_file(prior_stan_code))
+
+female_sim <- rbinom(N, 1, 0.5)
+
+sim_prior <- prior_model$sample(
+  data = list(N = N, female = female_sim),
+  fixed_param = TRUE,
+  chains = 1,
+  iter_sampling = 1000,
+  seed = 123
+)
+
+log_wage_sim_draws <- sim_prior$draws("log_wage_sim", format = "matrix")
+
+y_fake <- as.numeric(log_wage_sim_draws[1, ])
+ppc_dens_overlay(y = y_fake, yrep = log_wage_sim_draws[1:50, ])
+```
+
+
+## Ajuste del Modelo en R usando `cmdstanr`
+
+Para ajustar el modelo es necesario:
+
+- Pasar los datos a una lista para que stan los lea
+- compilar el modelo en cmdstanr (paralelización)
+- estimar las posteriores con `model$sample`
+
+```{r stan-log-model}
+stan_data <- list(N = N, log_wage = data$log_wage, female = data$female)
+model <- cmdstan_model(write_stan_file(stan_code), cpp_options = list(stan_threads = TRUE))
+fit_log <- model$sample(
+  data = stan_data,
+  chains = 4, #cuantas cadenas
+  parallel_chains = 4, #cuantas en paralelo
+  threads_per_chain = 2, #cuantas dividas en los núcleos
+  iter_sampling = 2000, #total de iteraciones
+  iter_warmup = 500, #calentamiento
+  seed = 123 #replicabilidad de arranque del algoritmo
+)
+```
+
+Valores de los parámetros:
+
+```{r}
+fit_log$print(variables = c("alpha", "beta", "sigma"))
+```
+
+
+## Diagnóstico: Convergencia
+
+```{r trace-plots}
+draws_array <- fit_log$draws(variables = c("alpha", "beta", "sigma"))
+mcmc_trace(draws_array)
+```
+
+## Verificación Posterior Predictiva (PPC)
+
+```{r ppc-check}
+log_wage_rep <- fit_log$draws(variables = "log_wage_rep", format = "matrix")
+log_wage_obs <- data$log_wage
+ppc_dens_overlay(y = log_wage_obs, yrep = log_wage_rep[1:50, ])
+```
+
+## Inferencia
+
+La estimación de `beta` indica la diferencia en el **logaritmo del salario** entre hombres y mujeres. Para interpretarlo en la escala original:
+
+```{r interpret-beta}
+draws <- fit_log$draws(variables = "beta", format = "df")
+exp_beta <- exp(draws$beta)
+quantile(exp_beta, probs = c(0.025, 0.5, 0.975))
+```
+
+El salario de las mujeres es, en mediana, aproximadamente el 91% del salario de los hombres (exp(β) ≈ 0.91).
+
+Hay bastante incertidumbre: el intervalo creíble del 95% va de 81% a 103% del salario masculino.
+
+Dado que el intervalo incluye 1, no hay evidencia clara de una brecha salarial significativa en esta simulación.
+
+## Comparación Frequentista (log-salario)
+
+```{r lm-log-model}
+lm_fit_log <- lm(log(wage) ~ female, data = data)
+summary(lm_fit_log)
+```
+
+## Discusión
+
+- En este ejemplo, el modelo lineal clásico muestra un valor-p aparentemente significativo.
+- Sin embargo, el modelo bayesiano con una prior informativa moderada refleja mayor escepticismo y reduce la magnitud del efecto.
+- Esto demuestra cómo los priors pueden protegernos de falsos positivos cuando tenemos poco poder estadístico o muestras pequeñas.
+
+## Preguntas
+
+- ¿Cómo interpretamos el efecto `beta` bajo cada enfoque?
+- ¿Qué rol juega la prior? ¿Puede evitar que saquemos conclusiones precipitadas?
+- ¿Cómo influye el tamaño muestral en la credibilidad del efecto observado?
+- ¿Cuándo sería razonable usar una prior informativa?
+
+## Elección de malos priors
+
+¿Qué pasa si usamos malos priors a la clásica?
+
+```{r}
+stan_bad_prior <- "
+data {
+  int<lower=0> N;   // tamaño de muestra
+  vector[N] log_wage; // variable dependiente
+  vector[N] female; // variable explicativa
+}
+parameters {
+  real alpha; // ordenada al origen
+  real beta; // parámetro de la diferencia hombres-mujeres
+  real<lower=0> sigma; // varianza
+}
+model {
+  alpha ~ normal(0, 100);  // absurdamente vaga
+  beta ~ normal(0, 100);   // absurdamente vaga
+  sigma ~ cauchy(0, 10);    // colas extremadamente pesadas
+
+  log_wage ~ normal(alpha + beta .* female, sigma);
+}
+generated quantities {
+  vector[N] log_wage_rep;
+  for (i in 1:N) {
+    log_wage_rep[i] = normal_rng(alpha + beta * female[i], sigma);
+  }
+}
+"
+bad_model <- cmdstan_model(write_stan_file(stan_bad_prior),cpp_options = list(stan_threads = TRUE))
+
+fit_bad <- bad_model$sample(
+  data = stan_data,
+  chains = 4,
+  parallel_chains = 4,
+  iter_sampling = 1000,
+  threads_per_chain = 2,
+  iter_warmup = 500,
+  seed = 123
+)
+mcmc_trace(fit_bad$draws(c("alpha", "beta", "sigma")))
+fit_bad$cmdstan_diagnose()
+```
+
+```{r}
+fit_bad$print(variables = c("alpha", "beta", "sigma"))
+log_wage_rep_bad <- fit_bad$draws("log_wage_rep", format = "matrix")
+ppc_dens_overlay(y = data$log_wage, yrep = log_wage_rep_bad[1:50, ])
+
+```
+
+
+
+
