@@ -1,0 +1,401 @@
+---
+title: "Análisis Bayesiano de Salarios con brms"
+subtitle: "PPCs, LOO-CV y Comparación de Modelos"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", cache = TRUE)
+library(brms)
+library(loo)
+library(bayesplot)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(knitr)
+
+set.seed(2024)
+color_scheme_set("viridis")
+```
+
+---
+
+# Datos
+
+```{r simular}
+n <- 2000
+
+escolaridad <- round(runif(n, 6, 20))
+experiencia <- round(runif(n, 0, 40))
+sector      <- factor(sample(c("formal", "informal"), n, replace = TRUE,
+                              prob = c(0.55, 0.45)))
+sexo        <- factor(sample(c("hombre", "mujer"), n, replace = TRUE,
+                              prob = c(0.52, 0.48)))
+region      <- factor(sample(c("norte", "centro", "sur"), n, replace = TRUE,
+                              prob = c(0.35, 0.40, 0.25)))
+
+log_mu <- 5.5 +
+  0.06  * escolaridad +
+  0.015 * experiencia +
+  0.35  * (sector == "formal") +
+ -0.20  * (sexo   == "mujer") +
+  0.15  * (region == "norte") +
+ -0.12  * (region == "sur")
+
+mu_cond <- exp(log_mu)
+
+salario_raw <- { y <- rbeta(n, 2, 4); y / (1 - y) }
+salario     <- pmax(salario_raw * (mu_cond / mean(salario_raw)), 30)
+
+datos <- data.frame(salario, escolaridad, experiencia, sector, sexo, region)
+```
+
+```{r viz-datos, fig.height=4}
+p1 <- ggplot(datos, aes(x = salario)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 55,
+                 fill = "#3182bd", alpha = 0.75, color = "white") +
+  geom_density(color = "#e6550d", linewidth = 1) +
+  scale_x_continuous(labels = scales::comma) +
+  labs(x = "Salario diario (pesos)", y = "Densidad") +
+  theme_bw()
+
+p2 <- ggplot(datos, aes(x = log(salario))) +
+  geom_histogram(aes(y = after_stat(density)), bins = 40,
+                 fill = "#756bb1", alpha = 0.75, color = "white") +
+  geom_density(color = "#e6550d", linewidth = 1) +
+  labs(x = "log(salario)", y = "Densidad") +
+  theme_bw()
+
+p1 | p2
+```
+
+---
+
+# Priors
+
+priors_base son los compartidos en todos los modelos.
+
+- Modelo distribución normal: priors_gaussian `exponential(0.1)` estrictamente positivo.
+
+- Modelo log-normal: priors_lognormal 
+
+- Modelo skew-normal: priors_skewnormal se tiene la dispersión más la asimetría 
+
+- Modelo gamma: priors_gamma el parámetro de shape que tiene que ser estrictamente positivo
+
+```{r priors}
+f <- salario ~ escolaridad + experiencia + sector + sexo + region
+
+priors_base <- c(
+  prior(normal(0, 10), class = b),
+  prior(normal(0, 10), class = Intercept)
+)
+
+priors_gaussian   <- c(priors_base, prior(exponential(0.1), class = sigma))
+priors_lognormal  <- c(priors_base, prior(exponential(0.1), class = sigma))
+priors_skewnormal <- c(priors_base, prior(normal(0, 10), class = sigma),
+                                    prior(normal(0, 10), class = alpha))
+priors_gamma      <- c(priors_base, prior(exponential(0.1), class = shape))
+```
+
+---
+
+# Modelos
+
+`file` salva los resultados de los parámetros. También puedes usar `save(m1)` por ejemplo. Pero con `cmdstanr` es mejor guardarlos en *.csv. 
+
+```{r modelos, results='hide', cache=TRUE}
+file.remove(c("m1_normal.rds", "m2_lognormal.rds", 
+              "m3_skewnormal.rds", "m4_gamma.rds"))
+
+m1 <- brm(f, datos, gaussian(),         priors_gaussian,
+          chains = 4, cores = 4, iter = 2000, backend = "cmdstanr",
+          save_pars = save_pars(all = TRUE),
+          file = "m1_normal",    file_refit = "on_change")
+
+m2 <- brm(f, datos, lognormal(),        priors_lognormal,
+          chains = 4, cores = 4, iter = 2000, backend = "cmdstanr",
+          save_pars = save_pars(all = TRUE),
+          file = "m2_lognormal", file_refit = "on_change")
+
+m3 <- brm(f, datos, skew_normal(),      priors_skewnormal,
+          chains = 4, cores = 4, iter = 2000, backend = "cmdstanr",
+          save_pars = save_pars(all = TRUE),
+          file = "m3_skewnormal", file_refit = "on_change")
+
+m4 <- brm(f, datos, Gamma(link = "log"), priors_gamma,
+          chains = 4, cores = 4, iter = 2000, backend = "cmdstanr",
+          save_pars = save_pars(all = TRUE),
+          file = "m4_gamma",     file_refit = "on_change")
+```
+
+# Diagnósticos MCMC
+
+```{r diagnosticos}
+modelos <- list(Normal = m1, LogNormal = m2, SkewNormal = m3, Gamma = m4)
+
+lapply(names(modelos), function(nm) {
+  mod <- modelos[[nm]]
+  np  <- nuts_params(mod)
+  data.frame(
+    Modelo       = nm,
+    Rhat_max     = round(max(brms::rhat(mod),       na.rm = TRUE), 4),
+    ESS_min      = round(min(brms::neff_ratio(mod), na.rm = TRUE), 3),
+    Divergencias = sum(np$Value[np$Parameter == "divergent__"])
+  )
+}) |> bind_rows() |>
+  kable(caption = "R-hat < 1.01 y ESS > 0.1 indican convergencia.")
+```
+
+---
+
+## Prior Predictive Checks
+
+Noten que solamente necesitamos usar `sample_prior`. En este caso `file_refit = "on_change"` se usa para que recompile si hay cambios sustantivos al modelo (nuevas variables o nuevos priors). 
+
+```{r ppc-prior, results='hide', cache=TRUE}
+m1_prior <- update(m1, sample_prior = "only", file = "m1_prior",
+                   file_refit = "on_change")
+m4_prior <- update(m4, sample_prior = "only", file = "m4_prior",
+                   file_refit = "on_change")
+```
+
+```{r ppc-prior-viz, fig.height=4}
+lim <- c(0, 5000)
+
+pp1 <- pp_check(m1_prior, ndraws = 100) +
+  coord_cartesian(xlim = lim) +
+  labs(title = "Prior predictive — Normal") + theme_bw()
+
+pp4 <- pp_check(m4_prior, ndraws = 100) +
+  coord_cartesian(xlim = lim) +
+  labs(title = "Prior predictive — Gamma") + theme_bw()
+
+pp1 | pp4
+```
+
+---
+
+## Posterior Predictive Checks
+
+```{r yrep, cache=FALSE}
+y_obs <- datos$salario
+
+yrep1 <- posterior_predict(m1, newdata = datos, ndraws = 200)
+yrep2 <- posterior_predict(m2, newdata = datos, ndraws = 200)
+yrep3 <- posterior_predict(m3, newdata = datos, ndraws = 200)
+yrep4 <- posterior_predict(m4, newdata = datos, ndraws = 200)
+```
+
+```{r ppc-densidades, fig.height=8}
+lim <- c(0, 4000)
+
+(ppc_dens_overlay(y_obs, yrep1) + coord_cartesian(xlim = lim) +
+   labs(title = "M1: Normal") + theme_bw() |
+ ppc_dens_overlay(y_obs, yrep2) + coord_cartesian(xlim = lim) +
+   labs(title = "M2: Log-Normal") + theme_bw()) /
+(ppc_dens_overlay(y_obs, yrep3) + coord_cartesian(xlim = lim) +
+   labs(title = "M3: Skew-Normal") + theme_bw() |
+ ppc_dens_overlay(y_obs, yrep4) + coord_cartesian(xlim = lim) +
+   labs(title = "M4: Gamma") + theme_bw()) +
+  plot_annotation(
+    title    = "PPC: densidades posteriores predictivas",
+    subtitle = "Línea oscura = observado | Líneas claras = réplicas"
+  )
+```
+
+Ahora vamos a graficar si el modelo predice bien los valores al percentil 90. Separamos las graficas para que se vean mejor. 
+
+```{r ppc-stats-media, fig.height=4, fig.width=12}
+q90 <- function(x) quantile(x, 0.90)
+
+ppc_stat(y_obs, yrep1, stat = "mean") + labs(title = "M1 — Media") + theme_bw() |
+ppc_stat(y_obs, yrep2, stat = "mean") + labs(title = "M2 — Media") + theme_bw() |
+ppc_stat(y_obs, yrep3, stat = "mean") + labs(title = "M3 — Media") + theme_bw() |
+ppc_stat(y_obs, yrep4, stat = "mean") + labs(title = "M4 — Media") + theme_bw()
+```
+
+```{r ppc-stats-p90, fig.height=4, fig.width=12}
+ppc_stat(y_obs, yrep1, stat = q90) + labs(title = "M1 — P90") + theme_bw() |
+ppc_stat(y_obs, yrep2, stat = q90) + labs(title = "M2 — P90") + theme_bw() |
+ppc_stat(y_obs, yrep3, stat = q90) + labs(title = "M3 — P90") + theme_bw() |
+ppc_stat(y_obs, yrep4, stat = q90) + labs(title = "M4 — P90") + theme_bw()
+```
+
+---
+
+## LOO-CV
+
+```{r loo, cache=FALSE}
+m1 <- add_criterion(m1, "loo")
+m2 <- add_criterion(m2, "loo")
+m3 <- add_criterion(m3, "loo")
+m4 <- add_criterion(m4, "loo")
+
+loos <- list(m1$criteria$loo, m2$criteria$loo,
+             m3$criteria$loo, m4$criteria$loo)
+nms  <- c("M1 Normal", "M2 Log-Normal", "M3 Skew-Normal", "M4 Gamma")
+
+data.frame(
+  Modelo = nms,
+  ELPD   = round(sapply(loos, \(l) l$estimates["elpd_loo", 1]), 1),
+  SE     = round(sapply(loos, \(l) l$estimates["elpd_loo", 2]), 1),
+  k_malo = sapply(loos, \(l) sum(l$diagnostics$pareto_k > 0.7))
+) |> kable(col.names = c("Modelo", "ELPD", "SE", "k > 0.7"),
+           caption   = "Mayor ELPD = mejor predicción fuera de muestra.")
+```
+
+```{r pareto-k, fig.height=8}
+plot_k <- function(loo_obj, titulo) {
+  k  <- loo_obj$diagnostics$pareto_k
+  df <- data.frame(
+    obs   = seq_along(k), k = k,
+    grupo = cut(k, c(-Inf, 0.5, 0.7, 1, Inf),
+                labels = c("< 0.5", "0.5–0.7", "0.7–1.0", "> 1.0"))
+  )
+  pal <- c("< 0.5" = "#2ca25f", "0.5–0.7" = "#feb24c",
+           "0.7–1.0" = "#f03b20", "> 1.0" = "#bd0026")
+  ggplot(df, aes(x = obs, y = k, color = grupo)) +
+    geom_point(size = 1, alpha = 0.7) +
+    geom_hline(yintercept = c(0.5, 0.7), linetype = "dashed",
+               color = c("#feb24c", "#f03b20")) +
+    scale_color_manual(values = pal, name = "k") +
+    labs(title = titulo, x = "Observación", y = "k de Pareto") +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "bottom")
+}
+
+(plot_k(loos[[1]], "M1: Normal")     | plot_k(loos[[2]], "M2: Log-Normal")) /
+(plot_k(loos[[3]], "M3: Skew-Normal") | plot_k(loos[[4]], "M4: Gamma"))
+```
+
+---
+
+## Comparación de Modelos
+
+```{r comparacion}
+loo_compare(m1, m2, m3, m4) |> print(simplify = FALSE)
+```
+
+```{r stacking}
+loo_model_weights(loos, method = "stacking") |>
+  as.numeric() |> round(3) |>
+  (\(x) data.frame(Modelo = nms, Peso = x))() |>
+  kable(caption = "Pesos de stacking — mayor peso = mejor modelo predictivo.")
+```
+
+---
+
+## Coeficientes del Mejor Modelo
+
+```{r coeficientes, fig.height=5}
+mcmc_intervals(
+  as_draws_array(m4),
+  pars = c("b_escolaridad", "b_experiencia", "b_sectorinformal",
+           "b_sexomujer", "b_regionnorte", "b_regionsur"),
+  prob = 0.80, prob_outer = 0.95
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(title    = "Coeficientes — Modelo Gamma (log link)",
+       subtitle = "Intervalos de credibilidad al 80% y 95%",
+       x        = "Efecto sobre log(salario)") +
+  theme_bw()
+```
+
+# Avanzado: Pasar nuevas distribuciones a brms
+
+1. Definir la familiar
+2. Escribir funciones en Stan (Stan Forum)
+3. Ajustar el modelo
+4. Funciones de procesamiento posterior predictive checks, cálculo de leave-one out
+
+```{r}
+beta_prime <- custom_family(
+  "beta_prime",
+  dpars   = c("mu", "phi"),        # parámetros: media y precisión
+  links   = c("log", "log"),       # ambos deben ser positivos
+  lb      = c(0, 0),               # lower bounds
+  type    = "real"                 # outcome continuo
+)
+
+stan_funs <- "
+  real beta_prime_lpdf(real y, real mu, real phi) {
+    real alpha = mu * phi;
+    real beta  = phi;
+    return beta_lpdf(y / (1 + y) | alpha, beta) - log1p(y) - log(y + 1);
+  }
+  
+  real beta_prime_rng(real mu, real phi) {
+    real alpha = mu * phi;
+    real beta  = phi;
+    real u = beta_rng(alpha, beta);
+    return u / (1 - u);
+  }
+"
+
+stan_vars <- stanvar(scode = stan_funs, block = "functions")
+```
+
+```{r}
+priors_bp <- c(
+  prior(normal(0, 10), class = b),
+  prior(normal(0, 10), class = Intercept),
+  prior(exponential(0.1), class = phi)    # phi > 0
+)
+
+m_bp <- brm(
+  salario ~ escolaridad + experiencia + sector + sexo + region,
+  data      = datos,
+  family    = beta_prime,
+  stanvars  = stan_vars,
+  prior     = priors_bp,
+  chains    = 14, cores = 14, iter = 2000,
+  backend   = "cmdstanr",
+  file      = "m_betaprime",
+  file_refit = "on_change"
+)
+```
+
+```{r}
+posterior_predict_beta_prime <- function(i, prep, ...) {
+  mu  <- brms::get_dpar(prep, "mu")[, i]   # columna i, no fila
+  phi <- brms::get_dpar(prep, "phi")
+  alpha <- mu * phi
+  beta  <- phi
+  u <- rbeta(length(mu), alpha, beta)
+  u / (1 - u)
+}
+
+log_lik_beta_prime <- function(i, prep) {
+  mu  <- brms::get_dpar(prep, "mu")[, i]
+  phi <- brms::get_dpar(prep, "phi")
+  y   <- prep$data$Y[i]
+  alpha <- mu * phi
+  beta  <- phi
+  u <- y / (1 + y)
+  dbeta(u, alpha, beta, log = TRUE) - 2 * log(1 + y)  # jacobiano correcto
+}
+```
+
+Chequeo predictivo posterior
+
+```{r}
+pp_check(m_bp, ndraws = 100) + xlim(0,4000)
+```
+
+Comparamos todos los modelos
+
+```{r}
+m_bp <- add_criterion(m_bp, "loo")
+loo_compare(m1, m2, m3, m4, m_bp) |> print(simplify = FALSE)
+```
+
+
+

@@ -1,0 +1,429 @@
+---
+title: "Elección de modelos"
+author: "Héctor Nájera"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(brms)
+library(sn)
+```
+
+```{r eval=FALSE, include=FALSE}
+set.seed(123)
+n <- 60
+anios <- 1960:(1960 + n - 1)
+
+inversion_tasa <- rnorm(n, mean = 3, sd = 2)  # señal fuerte
+educacion_tasa <- rnorm(n, mean = 1, sd = 0.3)
+politica <- as.integer(anios >= 2005)
+
+# Parámetros verdaderos
+alpha <- 1.0
+beta1 <- 0.5
+beta2 <- 1.1
+beta3 <- 1.2
+
+mu_verdadero <- numeric(n)
+mu_verdadero[1:2] <- 2
+
+for (t in 3:n) {
+  mu_verdadero[t] <- alpha +
+    beta1 * inversion_tasa[t - 1] +
+    beta2 * educacion_tasa[t] +
+    beta3 * politica[t]
+}
+
+# Perturbación suave y skew-normal
+perturbacion <- rnorm(n, 0, 0.8)
+asimetria <- 2.5
+pib_crecimiento <- rsn(n, xi = mu_verdadero + perturbacion, omega = 0.8, alpha = asimetria)
+
+# Datos
+datos <- tibble(
+  anio = anios,
+  pib_crecimiento = pib_crecimiento,
+  inversion = inversion_tasa,
+  educacion = educacion_tasa,
+  politica = factor(politica)
+) %>%
+  mutate(inversion_lag1 = lag(inversion, 1)) %>%
+  filter(!is.na(inversion_lag1))
+save(datos,file="datos")
+```
+
+# Introducción
+
+En este ejercicio exploramos cómo diferentes decisiones de modelado pueden afectar la capacidad de un modelo bayesiano para representar y predecir correctamente el crecimiento económico. Utilizamos datos simulados que representan la tasa anual de crecimiento del PIB per cápita, modelada en función de tres factores clave:
+
+- La tasa de crecimiento de la inversión tecnológica rezagada un año (inversion_lag1),
+
+- El crecimiento en años promedio de educación (educacion),
+
+- Y una variable indicadora de política pública implementada a mitad del periodo observado (politica).
+
+El objetivo es mostrar cómo el desempeño de distintos modelos puede variar al modificar dos aspectos fundamentales:
+
+- La distribución asumida para los errores: se comparan modelos con errores normales, lognormales y skew-normal (asimétricos).
+
+- La estructura temporal del modelo: se contrasta un modelo estándar con otro que incorpora autocorrelación temporal AR(1) en los errores, lo que permite capturar dependencias entre los años consecutivos.
+
+A través de la estimación con brms (usando cmdstanr como backend) y el uso del criterio Leave-One-Out cross-validation (LOO), se evalúa la capacidad predictiva de cada modelo. Esto permite identificar si incorporar la autocorrelación o suponer distribuciones más flexibles mejora el ajuste a los datos.
+
+## Hipótesis
+
+La hipótesis es que el creicmiento de la inversión en tecnología tiene un efecto positivo de entre .1 y .5 puntos porcentuales sobre el PIB. 
+
+# Cargamos los datos
+
+```{r}
+load("datos")
+```
+
+```{r}
+head(datos)
+```
+
+# Descriptivos
+
+```{r}
+library(ggplot2)
+
+ggplot(datos, aes(x = pib_crecimiento)) +
+  geom_histogram(aes(y = ..density..), bins = 20, fill = "lightblue", color = "white") +
+  geom_density(color = "darkblue", size = 1.2) +
+  labs(
+    title = "Distribución del crecimiento del PIB per cápita",
+    x = "Tasa de crecimiento (%)",
+    y = "Densidad"
+  ) +
+  theme_minimal()
+```
+
+
+# Modelo 1: con distribución normal y efectos contemporáneos
+
+## Modelo generativo
+
+El siguiente modelo asume que la tasa de crecimiento del PIB per cápita sigue una distribución normal, con media determinada por una combinación lineal de predictores:
+
+\[
+\begin{align*}
+y_t &\sim \mathcal{N}(\mu_t, \sigma) \\
+\mu_t &= \alpha + \beta_1 \cdot \text{inversion}_t + \beta_2 \cdot \text{educacion}_t + \beta_3 \cdot \text{politica}_t
+\end{align*}
+\]
+
+Donde:
+
+- \( y_t \) es la tasa de crecimiento del PIB per cápita en el año \( t \),
+- \( \text{inversion}_t \) es la tasa de crecimiento de inversión en tecnología,
+- \( \text{educacion}_t \) es el crecimiento en escolaridad promedio,
+- \( \text{politica}_t \in \{0, 1\} \) indica la presencia de una política pública.
+
+Los parámetros del modelo siguen las siguientes distribuciones a priori:
+
+\[
+\begin{align*}
+\alpha &\sim \mathcal{N}(0, 1) \\
+\beta_j &\sim \mathcal{N}(0, 1) \quad \text{para } j = 1, 2, 3 \\
+\sigma &\sim \text{Exponencial}(1)
+\end{align*}
+\]
+
+## Estimación
+
+Este modelo es estimado usando `brms()` con el backend de `cmdstanr`, con muestreo en 4 cadenas y 2000 iteraciones cada una, aprovechando 4 hilos de ejecución.
+
+```{r}
+modelo_normal <- brm(
+  pib_crecimiento ~ inversion + educacion + politica,
+  data = datos,
+  family = gaussian(),
+  backend = "cmdstanr",
+  threads = threading(4),  
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1), class = "Intercept"),
+    prior(exponential(1), class = "sigma")
+  ),
+  chains = 4, iter = 2000, seed = 123, cores=8,
+)
+pp_check(modelo_normal, nsamples = 100)
+
+```
+
+# Modelo 1: AR(1)
+
+## Modelo
+
+El siguiente modelo asume que la tasa de crecimiento del PIB per cápita sigue una distribución normal, con media determinada por una combinación lineal de predictores. Además, los **errores del modelo están autocorrelacionados en el tiempo** siguiendo una estructura autorregresiva de primer orden (AR(1)):
+
+\[
+\begin{align*}
+y_t &\sim \mathcal{N}(\mu_t, \sigma) \\
+\mu_t &= \alpha + \beta_1 \cdot \text{inversion}_{t-1} + \beta_2 \cdot \text{educacion}_t + \beta_3 \cdot \text{politica}_t \\
+\varepsilon_t &= y_t - \mu_t \\
+\varepsilon_t &= \rho \cdot \varepsilon_{t-1} + \eta_t, \quad \eta_t \sim \mathcal{N}(0, \sigma_{\text{err}})
+\end{align*}
+\]
+
+Donde:
+
+- \( y_t \) es la tasa de crecimiento del PIB per cápita en el año \( t \),
+- \( \text{inversion}_{t-1} \) es la tasa de inversión rezagada un año,
+- \( \text{educacion}_t \) es el crecimiento en escolaridad promedio,
+- \( \text{politica}_t \in \{0, 1\} \) indica la presencia de una política pública,
+- \( \rho \) es el coeficiente de autocorrelación AR(1) entre los errores.
+
+Después de calcular la media, los **residuos del modelo** se definen como:
+
+\[
+\varepsilon_t = y_t - \mu_t
+\]
+
+En lugar de asumir que estos errores son independientes, aquí se modela que los errores están **correlacionados en el tiempo** usando una estructura **autorregresiva de primer orden (AR(1))**:
+
+\[
+\varepsilon_t = \rho \cdot \varepsilon_{t-1} + \eta_t \quad \text{con} \quad \eta_t \sim \mathcal{N}(0, \sigma_{\text{err}})
+\]
+
+Esto quiere decir que el error en el año \( t \) **depende del error del año anterior**, escalado por un parámetro de autocorrelación \( \rho \), más un nuevo término aleatorio \( \eta_t \) que sigue una distribución normal con media cero y desviación estándar \( \sigma_{\text{err}} \).
+
+Los parámetros del modelo siguen distribuciones a priori no informativas o débilmente informativas (por defecto en este caso). Esta especificación permite capturar dependencias temporales residuales que no son explicadas directamente por los predictores.
+
+Esto indica que se modela la autocorrelación en los errores usando un modelo autorregresivo de orden 1 (AR(1)). Esta es una función de brms (y basada en nlme) que especifica una estructura de autocorrelación temporal. 
+
+Este es un modelo de fórmula de grupo temporal, que se interpreta como:
+
+anio: la variable de tiempo (en tu caso, los años 1960–2020).
+
+| 1: no hay agrupación. Aplica la autocorrelación a toda la serie completa (es decir, un único grupo con estructura temporal). 
+
+p=2 sería un AR(2)
+
+```{r}
+modelo_ar_error <- brm(
+  pib_crecimiento ~ inversion_lag1 + educacion + politica,
+  data = datos,
+  family = gaussian(),
+   backend = "cmdstanr",
+  autocor = cor_ar(~ anio | 1, p = 1),  
+  chains = 4, iter = 2000, seed = 123, cores=10,
+)
+
+pp_check(modelo_ar_error, nsamples = 100)
+```
+
+## Verificación de residuos
+
+Al igual que en la inferencia clásica nos gustaría contar con un modelo que no lleve a patrones sistemáticos en los residuales y que no exista algún tipo de autocorrelación serial (dependencia temporal).
+
+```{r}
+pp_check(modelo_ar_error, type = "dens_overlay", nsamples = 100)
+pp_check(modelo_ar_error, type = "scatter_avg")  # residuales vs media
+pp_check(modelo_ar_error, type = "stat", stat = "mean")
+```
+
+Acá la función de autocorrelación para verificar patrones temporales definitivos 
+
+```{r}
+residuos <- residuals(modelo_ar_error, summary = FALSE)
+dim(residuos)  # [n, iteraciones]
+res_medios <- apply(residuos, 1, mean)
+acf(res_medios, main = "ACF de los residuos (media posterior)")
+```
+
+## Comparación de ambos modelos
+
+modelo_ar_error es el modelo con mejor desempeño predictivo, por eso aparece con elpd_diff = 0.0. Sirve como referencia.
+
+modelo_normal tiene una diferencia de -16.8 puntos en elpd (expected log predictive density), lo que indica que predice significativamente peor que modelo_ar_error. 
+
+16.8 / 4.5 = 3.7 SE
+
+```{r}
+loo_normal <- loo(modelo_normal)
+loo_modelo_ar_error <- loo(modelo_ar_error)
+
+# Nota: Para poder hacer esta comparación los modelos necesitan el mismo número de observaciones
+comparacion_loo1 <- loo_compare(loo_normal, loo_modelo_ar_error)
+print(comparacion_loo1)
+
+```
+
+# Modelo lognormal
+
+```{r}
+modelo_lognormal <- brm(
+  pib_crecimiento ~ inversion + educacion + politica,
+  data = datos,
+  family = lognormal(),
+  backend = "cmdstanr",
+  threads = threading(4), 
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1), class = "Intercept"),
+    prior(exponential(1), class = "sigma")
+  ),
+  chains = 4, iter = 2000, seed = 123, cores=4,
+)
+pp_check(modelo_lognormal, nsamples = 100)
+```
+
+El modelo log_normal es el peor de los tres. 
+
+```{r}
+loo_normal <- loo(modelo_normal)
+loo_modelo_ar_error <- loo(modelo_ar_error)
+loo_modelo_lognormal <- loo(modelo_lognormal)
+# Nota: Para poder hacer esta comparación los modelos necesitan el mismo número de observaciones
+comparacion_loo2 <- loo_compare(loo_normal, loo_modelo_ar_error, loo_modelo_lognormal)
+print(comparacion_loo2)
+```
+
+# Modelo con distribución sesgada
+
+El siguiente modelo asume que la tasa de crecimiento del PIB per cápita sigue una distribución **skew-normal** (asimétrica), en lugar de una distribución normal simétrica. La media del modelo está determinada por una combinación lineal de predictores:
+
+\[
+\begin{align*}
+y_t &\sim \text{SkewNormal}(\mu_t, \sigma, \alpha) \\
+\mu_t &= \alpha_0 + \beta_1 \cdot \text{inversion}_t + \beta_2 \cdot \text{educacion}_t + \beta_3 \cdot \text{politica}_t
+\end{align*}
+\]
+
+Donde:
+
+- \( y_t \) es la tasa de crecimiento del PIB per cápita en el año \( t \),
+- \( \text{inversion}_t \) es la tasa de crecimiento de inversión en tecnología,
+- \( \text{educacion}_t \) es el crecimiento en escolaridad promedio,
+- \( \text{politica}_t \in \{0, 1\} \) indica la presencia de una política pública,
+- \( \sigma \) es el parámetro de escala (desviación estándar),
+- \( \alpha \) (no confundir con el intercepto) es el parámetro de **asimetría** de la distribución.
+
+Las distribuciones a priori utilizadas para los parámetros fueron:
+
+\[
+\begin{align*}
+\alpha_0 &\sim \mathcal{N}(0, 1) \\
+\beta_j &\sim \mathcal{N}(0, 1) \quad \text{para } j = 1, 2, 3 \\
+\sigma &\sim \mathcal{N}^{+}(0, 2) \quad \text{(truncada a valores positivos)} \\
+\alpha &\sim \mathcal{N}(0, 1)
+\end{align*}
+\]
+
+Este modelo permite capturar posibles **asimetrías en la distribución de los errores**, lo cual es especialmente útil si los datos presentan colas más largas hacia un lado o sesgos sistemáticos no explicados por los predictores.
+
+```{r}
+modelo_skew <- brm(
+  pib_crecimiento ~ inversion + educacion + politica,
+  data = datos,
+  backend = "cmdstanr",
+  threads = threading(14), 
+  family = skew_normal(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 1), class = "Intercept"),
+    prior(normal(0, 2), class = "sigma"),
+    prior(normal(0, 1), class = "alpha")
+  ),
+  chains = 4, iter = 2000, seed = 123, cores=4,
+)
+pp_check(modelo_skew, nsamples = 100)
+```
+
+```{r}
+loo_skew <- loo(modelo_skew)
+
+comparacion_loo4 <- loo_compare(loo_normal, loo_modelo_lognormal, loo_skew, loo_modelo_ar_error)
+print(comparacion_loo4)
+
+```
+
+# Modelo AR(1)
+
+```{r}
+modelo_ar_sknormal_error <- brm(
+  pib_crecimiento ~ inversion_lag1 + educacion + politica,
+  data = datos,
+  family = skew_normal(),
+  autocor = cor_ar(~ anio | 1, p = 1),  
+  backend = "cmdstanr", 
+  chains = 4, iter = 2500, seed = 123, cores = 10,
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(3, 1), class = "Intercept"),
+    prior(normal(0, 2), class = "sigma"),
+    prior(normal(0, 1), class = "alpha")
+  )
+)
+
+
+pp_check(modelo_ar_sknormal_error, nsamples = 100)
+```
+
+El modelo con autocorrelación AR(1) en los errores (modelo_ar_error) es el que presenta mejor capacidad predictiva, por lo tanto se utiliza como referencia (elpd_diff = 0.0).
+
+El modelo modelo_ar_sknormal_error, que además incorpora asimetría en la distribución del error, tiene un desempeño ligeramente inferior (elpd_diff = -3.4), pero la diferencia no es suficientemente grande dado el error estándar. Ambos modelos predicen de forma similar. Sin embargo, el modelo con skew_normal hace un mejor trabajo representando la distribución total en conjunto. 
+
+Los modelos modelo_skew y modelo_normal, que no incorporan autocorrelación, tienen un ajuste predictivo considerablemente peor, con una diferencia de más de 16 puntos en el elpd.
+
+Finalmente, el modelo modelo_lognormal presenta el peor desempeño predictivo, con una penalización de casi 29 puntos, lo que indica una mala especificación de la distribución del error en relación con los datos simulados.
+
+
+```{r}
+loo_modelo_ar_sknormal_error <- loo(modelo_ar_sknormal_error)
+
+comparacion_loo4 <- loo_compare(loo_normal, loo_modelo_lognormal, loo_modelo_ar_error, loo_skew, loo_modelo_ar_sknormal_error)
+print(comparacion_loo4)
+```
+
+# COmparación de posteriores
+
+```{r}
+library(posterior)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Extraer draws y agregar columna de modelo
+post_ar <- as_draws_df(modelo_ar_error) %>%
+  mutate(modelo = "AR normal")
+
+post_ar_skew <- as_draws_df(modelo_ar_sknormal_error) %>%
+  mutate(modelo = "AR skew-normal")
+
+# Unir y seleccionar las variables de interés
+post_combined <- bind_rows(post_ar, post_ar_skew) %>%
+  select(`b_inversion_lag1`, `b_politica1`, modelo) %>%
+  pivot_longer(
+    cols = starts_with("b_"),
+    names_to = "parámetro",
+    values_to = "valor"
+  )
+
+# Renombrar para claridad
+post_combined$parámetro <- recode(post_combined$parámetro,
+                                  `b_inversion_lag1` = "Inversión",
+                                  `b_politica1` = "Política pública")
+
+# Gráfico
+ggplot(post_combined, aes(x = valor, fill = modelo)) +
+  geom_density(alpha = 0.6) +
+  facet_wrap(~parámetro, scales = "fixed", ncol = 1) +
+  labs(
+    title = "Distribuciones posteriores comparadas",
+    x = "Valor del coeficiente",
+    y = "Densidad",
+    fill = "Modelo"
+  ) +
+  theme_minimal()
+
+```
+
