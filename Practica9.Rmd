@@ -1,0 +1,587 @@
+---
+title: "Estimación Bayesiana Multinivel con brms"
+subtitle: "No Pooling, Partial Pooling y Full Pooling — GDP per Cápita Mundial"
+author: "Hector Najera"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+  pdf_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache   = TRUE,
+  fig.width  = 9,
+  fig.height = 6
+)
+```
+
+```{r paquetes}
+library(brms)
+library(cmdstanr)
+library(tidyverse)
+library(patchwork)
+library(bayesplot)
+library(tidybayes)
+library(ggrepel)
+
+# Usar CmdStanR como backend
+options(brms.backend = "cmdstanr")
+set_cmdstan_path()  # usa la instalacion detectada automaticamente
+theme_set(theme_minimal(base_size = 13))
+```
+
+---
+
+# 1. Datos Simulados
+
+Simulamos un panel de 120 países en 6 regiones. Algunos países tienen muchos años de datos (*datos ricos*) y otros muy pocos (*datos escasos*). El objetivo es modelar cómo el **gasto público** (% del PIB) se relaciona con el **PIB per cápita** (log).
+
+```{r simular-datos}
+set.seed(2024)
+
+regiones <- c("América Latina", "Europa Occidental", "Asia Oriental",
+              "África Subsahariana", "Medio Oriente", "Asia Central")
+
+# Parámetros regionales "verdaderos"
+region_intercepts <- c(8.5, 10.2, 9.8, 7.4, 9.1, 8.0)
+region_slopes     <- c(0.08, 0.04, 0.06, 0.12, 0.07, 0.09)
+
+paises_por_region <- c(25, 20, 22, 28, 15, 10)
+
+datos_panel <- map2_dfr(
+  seq_along(regiones), regiones,
+  function(r_idx, r_nombre) {
+    n_paises <- paises_por_region[r_idx]
+
+    # Efectos aleatorios por país (alrededor del promedio regional)
+    alpha_j <- rnorm(n_paises, region_intercepts[r_idx], 0.5)
+    beta_j  <- rnorm(n_paises, region_slopes[r_idx],     0.02)
+
+    map_dfr(seq_len(n_paises), function(j) {
+      # Países "con pocos datos": los últimos 30% de cada región
+      n_obs <- if (j > floor(n_paises * 0.7)) sample(2:5, 1) else sample(10:30, 1)
+
+      tibble(
+        region  = r_nombre,
+        pais    = paste0(substr(r_nombre, 1, 3), "_", j),
+        gasto   = runif(n_obs, 15, 50),
+        log_gdp = alpha_j[j] + beta_j[j] * gasto + rnorm(n_obs, 0, 0.3)
+      )
+    })
+  }
+)
+
+glimpse(datos_panel)
+```
+
+```{r resumen-datos}
+# Número de observaciones por país
+obs_por_pais <- datos_panel %>%
+  count(region, pais, name = "n_obs") %>%
+  arrange(n_obs)
+
+# Países con pocos datos
+paises_escasos <- obs_por_pais %>% filter(n_obs <= 5) %>% pull(pais)
+cat("Países con ≤ 5 observaciones:", length(paises_escasos), "\n")
+
+obs_por_pais %>%
+  ggplot(aes(x = n_obs, fill = region)) +
+  geom_histogram(binwidth = 2, color = "white") +
+  labs(title = "Distribución de observaciones por país",
+       x = "N observaciones", y = "N países", fill = "Región")
+```
+
+---
+
+# 2. Los Tres Modelos de Pooling
+
+## 2.1 Conceptos Clave
+
+| Modelo | Supuesto | Ventaja | Desventaja |
+|---|---|---|---|
+| **No Pooling** | Cada país es independiente | Estimaciones específicas | Mal desempeño con pocos datos |
+| **Full Pooling** | Todos los países son iguales | Estable con pocos datos | Ignora heterogeneidad |
+| **Partial Pooling** | Los países comparten información | Balancea ambos extremos | Más complejo |
+
+El **partial pooling** (modelo multinivel) es el corazón de la estimación bayesiana jerárquica. Los coeficientes de cada país son atraídos hacia el promedio del grupo — fenómeno llamado **shrinkage** — siendo este efecto mayor cuando el país tiene **menos datos**.
+
+---
+
+## 2.2 Priors
+
+Definimos priors con información económica razonable:
+
+```{r priors}
+# log(GDP per capita) ~ 7–11 para la mayoría de países
+# Pendiente del gasto: efecto pequeño y positivo esperado
+# Variación entre países: moderada
+
+# No pooling: formula con 0 + pais elimina el intercepto global,
+# todos los coeficientes quedan en class = b (no existe class = Intercept)
+prior_nopool <- c(
+  prior(normal(9, 1.5),   class = b),   # cubre interceptos por país
+  prior(exponential(2),   class = sigma)
+)
+
+# Full pooling: tiene intercepto global → class = Intercept
+# y una sola pendiente → class = b
+prior_full <- c(
+  prior(normal(9, 1.5),   class = Intercept),
+  prior(normal(0.05, 0.1), class = b),
+  prior(exponential(2),   class = sigma)
+)
+
+# Partial pooling: igual que full en efectos fijos,
+# más hiperpriors para las desviaciones de los efectos aleatorios
+prior_partial <- c(
+  prior(normal(9, 1.5),   class = Intercept),
+  prior(normal(0.05, 0.1), class = b),
+  prior(exponential(1),   class = sd),     # variación entre grupos
+  prior(exponential(2),   class = sigma)   # variación dentro del grupo
+)
+```
+
+---
+
+## 2.3 Modelo 1: No Pooling
+
+Estimamos una ordenada al origen y pendiente **independiente** para cada país. Los países con pocos datos tienen estimaciones muy inciertas.
+
+```{r modelo-nopool, results='hide'}
+# 0 + pais: sin intercepto global → todos los coefs en class = b
+# gasto:pais: pendiente propia por país, sin pooling
+m_nopool <- brm(
+  formula = log_gdp ~ 0 + pais + gasto:pais,
+  data    = datos_panel,
+  prior   = prior_nopool,
+  chains  = 4, cores = 4, iter = 2000, warmup = 1000,
+  backend = "cmdstanr",
+  seed    = 42,
+  file    = "m_nopool"
+)
+```
+
+```{r check-nopool}
+summary(m_nopool, priors = TRUE)
+```
+
+---
+
+## 2.4 Modelo 2: Full Pooling
+
+Un solo intercepto y pendiente para todos los países. **Ignora la estructura de datos**.
+
+```{r modelo-full, results='hide'}
+m_full <- brm(
+  formula = log_gdp ~ 1 + gasto,
+  data    = datos_panel,
+  prior   = prior_full,
+  chains  = 4, cores = 4, iter = 2000, warmup = 1000,
+  backend = "cmdstanr",
+  seed    = 42,
+  file    = "m_full"
+)
+```
+
+```{r check-full}
+summary(m_full)
+```
+
+---
+
+## 2.5 Modelo 3: Partial Pooling (Multinivel)
+
+Interceptos y pendientes varían por **país** y por **región**, compartiendo información entre niveles.
+
+```{r modelo-partial, results='hide'}
+# Nivel 1: observación
+# Nivel 2: país (anidado en región)
+# Nivel 3: región
+
+m_partial <- brm(
+  formula = log_gdp ~ 1 + gasto +
+    (1 + gasto | region / pais),   # efectos aleatorios anidados
+  data    = datos_panel,
+  prior   = prior_partial,
+  chains  = 4, cores = 4, iter = 2000, warmup = 1000,
+  backend = "cmdstanr",
+  control = list(adapt_delta = 0.95),
+  seed    = 42,
+  file    = "m_partial"
+)
+```
+
+```{r check-partial}
+summary(m_partial)
+```
+
+---
+
+# 3. Diagnósticos MCMC
+
+```{r diagnosticos}
+# brmsfit usa summary() para obtener R-hat y Bulk/Tail ESS directamente
+diagnosticos <- as.data.frame(summary(m_partial)$fixed)
+cat("R-hat máximo (efectos fijos):", max(diagnosticos$Rhat, na.rm = TRUE), "\n")
+cat("Bulk ESS mínimo:             ", min(diagnosticos$Bulk_ESS, na.rm = TRUE), "\n")
+cat("Tail ESS mínimo:             ", min(diagnosticos$Tail_ESS, na.rm = TRUE), "\n")
+
+# Trace plots — convertir a array primero para bayesplot
+posterior_array <- as.array(m_partial)
+mcmc_trace(posterior_array, pars = c("b_Intercept", "b_gasto", "sigma"))
+```
+
+```{r pp-check}
+# Posterior predictive check
+pp_check(m_partial, ndraws = 100) +
+  labs(title = "Posterior Predictive Check — Partial Pooling")
+```
+
+---
+
+# 4. El Efecto Shrinkage
+
+El resultado más importante del partial pooling: los países con **pocos datos** son "jalados" hacia el promedio regional.
+
+```{r shrinkage}
+# Con (1 + gasto | region/pais), brms nombra el nivel anidado "region:pais"
+# Verificar nombres reales de los grouping factors:
+# names(coef(m_partial))  →  "region"  "region:pais"
+
+# Lista de países válidos en los datos (sin pendientes)
+paises_validos <- datos_panel %>% distinct(pais) %>% pull(pais)
+
+# --- No pooling: filtrar solo interceptos usando la lista de países conocidos
+# brms genera "b_paisAmé_1" (intercepto) y "b_paisAmé_1:gasto" (pendiente)
+coef_nopool <- as_draws_df(m_nopool) %>%
+  select(starts_with("b_pais")) %>%
+  pivot_longer(everything(), names_to = "param", values_to = "valor") %>%
+  mutate(pais = str_remove(param, "^b_pais")) %>%
+  filter(pais %in% paises_validos) %>%          # solo interceptos válidos
+  group_by(pais) %>%
+  summarise(est_nopool = mean(valor), sd_nopool = sd(valor))
+
+# --- Partial pooling: rownames tienen formato "NombreRegion_CodPais"
+# p.ej. "África Subsahariana_Áfr_1" donde el país es "Áfr_1"
+# Construimos tabla de lookup: region_pais_key → pais
+lookup <- datos_panel %>%
+  distinct(region, pais) %>%
+  mutate(rp_key = paste(region, pais, sep = "_"))
+
+coef_partial <- coef(m_partial)[["region:pais"]][, , "Intercept"] %>%
+  as.data.frame() %>%
+  rownames_to_column("rp_key") %>%
+  left_join(lookup, by = "rp_key") %>%
+  select(pais, est_partial = Estimate, sd_partial = Est.Error)
+
+# distinct(pais, region) puede dar duplicados si un país aparece en varias regiones
+# usamos slice(1) para garantizar una sola fila por país
+region_pais <- datos_panel %>%
+  distinct(pais, region) %>%
+  group_by(pais) %>%
+  slice(1) %>%
+  ungroup()
+
+comparacion <- coef_nopool %>%
+  left_join(coef_partial,                        by = "pais") %>%
+  left_join(obs_por_pais %>% select(pais, n_obs), by = "pais") %>%
+  left_join(region_pais,                          by = "pais") %>%
+  mutate(escaso = pais %in% paises_escasos)
+
+# Cleveland dot plot: cada fila es un país,
+# segmento conecta No Pooling (○) con Partial Pooling (●)
+comparacion_long <- comparacion %>%
+  pivot_longer(c(est_nopool, est_partial),
+               names_to = "modelo", values_to = "estimacion") %>%
+  mutate(modelo = recode(modelo,
+    est_nopool  = "No Pooling",
+    est_partial = "Partial Pooling"
+  ))
+
+# unique() garantiza que orden_paises no tenga duplicados
+orden_paises <- comparacion %>%
+  mutate(shrinkage = abs(est_nopool - est_partial)) %>%
+  arrange(desc(escaso), desc(shrinkage)) %>%
+  pull(pais) %>%
+  unique()
+
+comparacion_long %>%
+  mutate(pais = factor(pais, levels = orden_paises)) %>%
+  ggplot(aes(x = estimacion, y = pais)) +
+  geom_line(aes(group = pais, color = escaso), linewidth = 0.5, alpha = 0.6) +
+  geom_point(aes(shape = modelo, color = escaso), size = 2.5) +
+  scale_shape_manual(values = c("No Pooling" = 1, "Partial Pooling" = 19),
+                     name = NULL) +
+  scale_color_manual(values = c("FALSE" = "gray60", "TRUE" = "tomato"),
+                     labels = c("FALSE" = "Datos suficientes", "TRUE" = "Pocos datos"),
+                     name = NULL) +
+  labs(
+    title    = "Shrinkage: No Pooling (○) vs Partial Pooling (●)",
+    subtitle = "En rojo: países con ≤ 5 obs. El segmento muestra el jale hacia el promedio grupal.",
+    x        = "Intercepto posterior (log GDP per cápita)",
+    y        = NULL
+  ) +
+  theme(axis.text.y = element_text(size = 7))
+```
+
+```{r incertidumbre-comparada}
+# Separar las dos series con position_dodge para que no se solapen
+comparacion %>%
+  pivot_longer(c(sd_nopool, sd_partial), names_to = "modelo", values_to = "sd") %>%
+  mutate(modelo = recode(modelo,
+    sd_nopool  = "No Pooling",
+    sd_partial = "Partial Pooling"
+  )) %>%
+  ggplot(aes(x = n_obs, y = sd, color = modelo, fill = modelo)) +
+  # línea de tendencia primero (fondo)
+  geom_smooth(se = TRUE, alpha = 0.15, linewidth = 0.8) +
+  # puntos con jitter horizontal para separar solapamientos
+  geom_jitter(width = 0.3, height = 0, size = 2, alpha = 0.8, shape = 21,
+              color = "white", stroke = 0.3) +
+  scale_color_manual(values = c("No Pooling" = "#2166ac", "Partial Pooling" = "#d73027")) +
+  scale_fill_manual( values = c("No Pooling" = "#2166ac", "Partial Pooling" = "#d73027")) +
+  labs(
+    title    = "Incertidumbre vs Tamaño de Muestra por País",
+    subtitle = "Partial pooling reduce drásticamente la incertidumbre en países con pocos datos",
+    x        = "N observaciones", y = "Desviación estándar posterior",
+    color    = NULL, fill = NULL
+  )
+```
+
+---
+
+# 5. Predicciones Regionales
+
+```{r predicciones-regionales}
+# Grid de predicción para cada región
+grid_pred <- datos_panel %>%
+  distinct(region) %>%
+  crossing(gasto = seq(15, 50, length.out = 50))
+
+# Solo podemos hacer predicciones "de población" con partial pooling
+pred_full    <- add_epred_draws(m_full,    newdata = grid_pred, ndraws = 200)
+pred_partial <- add_epred_draws(m_partial, newdata = grid_pred,
+                                re_formula = ~ (1 + gasto | region), ndraws = 200)
+
+# Comparar intervalos de credibilidad
+bind_rows(
+  pred_full    %>% mutate(modelo = "Full Pooling"),
+  pred_partial %>% mutate(modelo = "Partial Pooling")
+) %>%
+  group_by(modelo, region, gasto) %>%
+  median_qi(.epred, .width = 0.89) %>%
+  ggplot(aes(x = gasto, y = .epred, color = modelo, fill = modelo)) +
+  geom_line(linewidth = 0.8) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper), alpha = 0.2, color = NA) +
+  facet_wrap(~ region, scales = "free_y") +
+  scale_color_manual(values = c("gray50", "steelblue")) +
+  scale_fill_manual(values  = c("gray50", "steelblue")) +
+  labs(
+    title   = "Predicciones por Región: Full vs Partial Pooling",
+    x       = "Gasto Público (% PIB)", y = "log(GDP per cápita)",
+    color   = NULL, fill = NULL
+  )
+```
+
+---
+
+# 6. Comparación de Modelos
+
+## 6.1 Leave-One-Out Cross-Validation (LOO)
+
+```{r loo, cache=TRUE}
+# moment_match = TRUE es incompatible con backend cmdstanr (requiere rstan)
+# Si hay warnings de k > 0.7, se puede usar reloo = TRUE en su lugar
+loo_full    <- loo(m_full)
+loo_partial <- loo(m_partial)
+
+loo_compare(loo_full, loo_partial)
+```
+
+## 6.2 Visualización del Ajuste
+
+```{r ajuste-paises-escasos}
+# Comparar las tres estrategias para países con pocos datos
+muestra_paises <- sample(paises_escasos, 6)
+
+datos_muestra <- datos_panel %>% filter(pais %in% muestra_paises)
+
+grid_pais <- datos_muestra %>%
+  group_by(pais, region) %>%
+  summarise(gasto = seq(min(gasto) - 5, max(gasto) + 5, length.out = 40),
+            .groups = "drop")
+
+# No pooling: no tiene efectos aleatorios, todos los coefs son fijos (b_)
+# allow_new_levels=FALSE porque el modelo solo conoce los países del training
+pred_np <- add_epred_draws(m_nopool, newdata = grid_pais,
+                           ndraws = 100) %>%
+  mutate(modelo = "No Pooling")
+
+# Full pooling: un solo intercepto global, re_formula=NA es correcto aquí
+pred_fp <- add_epred_draws(m_full, newdata = grid_pais,
+                           re_formula = NA, ndraws = 100) %>%
+  mutate(modelo = "Full Pooling")
+
+pred_pp <- add_epred_draws(m_partial, newdata = grid_pais, ndraws = 100) %>%
+  mutate(modelo = "Partial Pooling")
+
+bind_rows(pred_np, pred_fp, pred_pp) %>%
+  group_by(modelo, pais, gasto) %>%
+  median_qi(.epred, .width = 0.89) %>%
+  ggplot(aes(x = gasto, y = .epred, color = modelo, fill = modelo)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 0.9) +
+  geom_point(data = datos_muestra, aes(x = gasto, y = log_gdp),
+             inherit.aes = FALSE, size = 2, color = "black") +
+  facet_wrap(~ pais, scales = "free") +
+  scale_color_manual(values = c("gray40", "steelblue", "tomato")) +
+  scale_fill_manual(values  = c("gray40", "steelblue", "tomato")) +
+  labs(
+    title    = "Comparación de los Tres Modelos — Países con Pocos Datos",
+    subtitle = "Puntos negros = datos observados. El partial pooling balancea sesgo e incertidumbre.",
+    x        = "Gasto Público (% PIB)", y = "log(GDP per cápita)",
+    color    = NULL, fill = NULL
+  )
+```
+
+---
+
+# 7. Inferencia
+
+## 7.1 Efecto del Gasto Público por Región
+
+```{r efecto-region}
+# Extraer pendientes regionales del partial pooling
+pendientes_region <- coef(m_partial)$region[, , "gasto"] %>%
+  as.data.frame() %>%
+  rownames_to_column("region")
+
+pendientes_region %>%
+  ggplot(aes(x = reorder(region, Estimate),
+             y = Estimate, ymin = Q2.5, ymax = Q97.5)) +
+  geom_pointrange(size = 0.8, color = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+  coord_flip() +
+  labs(
+    title = "Efecto del Gasto Público sobre log(GDP) por Región",
+    subtitle = "Intervalos de credibilidad al 95%",
+    x = NULL, y = "Pendiente posterior"
+  )
+```
+
+## 7.2 Hipótesis y contrastes
+
+```{r hipotesis}
+# aleatorios (r_region[]). Usamos as_draws_df con los nombres exactos.
+draws_contraste <- as_draws_df(m_partial) %>%
+  mutate(diferencia = `r_region[Europa.Occidental,gasto]` -
+                      `r_region[África.Subsahariana,gasto]`)
+
+cat("P(β_Europa < β_África):", mean(draws_contraste$diferencia < 0), "\n")
+cat("IC 89%: [",
+    round(quantile(draws_contraste$diferencia, 0.055), 4), ",",
+    round(quantile(draws_contraste$diferencia, 0.945), 4), "]\n")
+
+# Visualizar la distribución posterior de la diferencia
+draws_contraste %>%
+  ggplot(aes(x = diferencia)) +
+  stat_halfeye(.width = c(0.5, 0.89), fill = "steelblue", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    title    = "Diferencia de pendientes: Europa Occidental − África Subsahariana",
+    subtitle = "Valores negativos indican que el efecto del gasto es menor en Europa",
+    x = "Diferencia en pendiente (gasto → log GDP)", y = NULL
+  )
+```
+
+Muestra solo el efecto aleatorio — la desviación de cada región respecto al promedio global. 
+
+```{r draws-pendientes}
+# Extraer el efecto fijo global de gasto
+beta_gasto <- fixef(m_partial)["gasto", "Estimate"]
+
+m_partial %>%
+  spread_draws(r_region[region, term], b_gasto) %>%
+  filter(term == "gasto") %>%
+  mutate(
+    region    = gsub(".", " ", region, fixed = TRUE),
+    pendiente_total = r_region + b_gasto    # efecto aleatorio + fijo
+  ) %>%
+  ggplot(aes(x = pendiente_total, y = reorder(region, pendiente_total))) +
+  stat_halfeye(.width = c(0.5, 0.89)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Pendiente Total por Región (efecto fijo + aleatorio)",
+    x = "Efecto del gasto sobre log(GDP)", y = NULL
+  )
+```
+
+---
+
+# 8. Resumen
+
+```{r tabla-resumen}
+tibble(
+  Modelo           = c("No Pooling", "Full Pooling", "Partial Pooling"),
+  Parámetros       = c("2 × N_países", "2", "2 + 2×N_grupos (hiperparámetros)"),
+  `Países escasos` = c("Alta incertidumbre", "Sesgo por pooling total", "Shrinkage óptimo"),
+  `Predicción OOS` = c("Mala", "Regular", "Mejor"),
+  Interpretación   = c("Directa por país", "Solo efecto promedio", "Efectos por nivel")
+) %>%
+  knitr::kable(caption = "Comparación de estrategias de pooling")
+```
+
+**Conclusión principal:** El partial pooling domina en casi todos los criterios. La información se comparte entre países de forma **proporcional a la confiabilidad de los datos locales**: los países ricos en datos retienen sus estimaciones propias; los países con pocos datos se benefician de la información colectiva de su región.
+
+---
+
+# Apéndice: Especificación del Modelo Multinivel
+
+$$
+\log(\text{GDP}_{ij}) = \alpha_j + \beta_j \cdot \text{Gasto}_{ij} + \varepsilon_{ij}
+$$
+
+**Nivel país** ($j$):
+$$
+\alpha_j \sim \mathcal{N}(\mu_{\alpha_r}, \sigma_\alpha), \quad
+\beta_j \sim \mathcal{N}(\mu_{\beta_r}, \sigma_\beta)
+$$
+
+**Nivel región** ($r$):
+$$
+\mu_{\alpha_r} \sim \mathcal{N}(\bar{\alpha}, \tau_\alpha), \quad
+\mu_{\beta_r} \sim \mathcal{N}(\bar{\beta}, \tau_\beta)
+$$
+
+**Hiperpriors**:
+$$
+\bar{\alpha} \sim \mathcal{N}(9, 1.5), \quad \bar{\beta} \sim \mathcal{N}(0.05, 0.1)
+$$
+$$
+\sigma_\alpha, \sigma_\beta, \tau_\alpha, \tau_\beta \sim \text{Exponencial}(1), \quad
+\varepsilon \sim \mathcal{N}(0, \sigma)
+$$
+
+En `brms` esto se expresa como:
+
+```r
+log_gdp ~ 1 + gasto + (1 + gasto | region / pais)
+```
+
+---
+
+```{r session-info}
+sessionInfo()
+```
